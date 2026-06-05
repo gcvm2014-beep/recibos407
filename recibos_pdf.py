@@ -4,10 +4,7 @@ recibos_pdf.py — Decreto 407/2026 / Ley 27.802 — Anexo III
 Uso: python recibos_pdf.py entrada.txt salida.pdf
 """
 import sys, re, os, tempfile
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+import math
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import cm
@@ -85,7 +82,7 @@ def parsear_bloque(lineas):
         fecha_pago_aportes='', administracion='',
         haberes=[], descuentos=[], contrib=[],
         total_a_pagar=0.0, tot_descontar=0.0,
-        total_contrib=0.0, tot_exentos=0.0, neto=0.0,
+        total_contrib=0.0, tot_exentos=0.0, neto=0.0, leyenda_neto='',
     )
     enc = 0
 
@@ -112,10 +109,12 @@ def parsear_bloque(lineas):
         # Legajo, fecha ingreso, sector, remuneración
         # formato: ' 20004    03/12/03             003             962.300,00'
         if not r['legajo']:
-            m = re.match(r'\s+(\d{4,})-?\s+(\d{2}/\d{2}/\d{2,4})\s+(\w+)\s+([\d.,]+)', col)
+            m = re.match(r'\s+(\d+)-?\s+(\d{2}/\d{2}/\d{2,4})\s+.*?([\d.]+[,]\d{2})\s*$', col)
             if m:
                 r['legajo']=m.group(1); r['fecha_ingreso']=m.group(2)
-                r['remuneracion']=m.group(4); continue
+                r['remuneracion'] = m.group(3)
+                continue
+                continue
 
         # Banco / fecha pago / período banco
         if not r['banco']:
@@ -143,6 +142,16 @@ def parsear_bloque(lineas):
         # Formato: '   UN MILLON...   1429036,00              '   (pos 44, texto a izq)
         #          '   TE PESOS.-                  243836,12   '   (pos 56, texto a izq)
         if re.search(r'(MILLON|MIL PESOS|PESOS\.)', col, re.I) and not re.match(r'\s{40,}', col):
+            # Extraer texto de la leyenda (quitar montos y guión cortado)
+            texto_ley = re.sub(r'\s+[\d.,]+\s*$', '', col).strip()  # quitar monto final
+            texto_ley = re.sub(r'-\s*$', '', texto_ley).strip()       # quitar guión de corte
+            texto_ley = texto_ley.strip()
+            if texto_ley and not re.search(r'NRO\.|OBRA SOCIAL|IMPORTE|ACREDITADO|CTA\.N', texto_ley, re.I):
+                if r['leyenda_neto']:
+                    r['leyenda_neto'] += ' ' + texto_ley
+                else:
+                    r['leyenda_neto'] = texto_ley
+            # Capturar montos
             montos_lin = [(m2.start(), pm(m2.group()))
                           for m2 in re.finditer(r'\d{4,}[,.]\d{2}', col)
                           if pm(m2.group()) > 1000]
@@ -151,6 +160,15 @@ def parsear_bloque(lineas):
                     if not r['tot_descontar']: r['tot_descontar'] = monto
                 elif pos >= 43:
                     if not r['total_a_pagar']: r['total_a_pagar'] = monto
+            continue
+
+        # ── Líneas intermedias de leyenda (sin monto, solo texto) ────────────
+        # Ej: '   DOS MIL CUATROCIENTOS CIN-'  '   RENTA MIL CUATROCIENTOS O-'
+        if re.match(r'\s{3,}', col) and re.search(r'(MIL|CIENTOS|NTOS|NTOS|PESOS)', col, re.I)                 and not re.match(r'\s{40,}', col)                 and not re.search(r'NRO\.|OBRA SOCIAL|IMPORTE|ACREDITADO|CTA\.N|\d{4,}', col, re.I):
+            texto_ley = col.strip()
+            texto_ley = re.sub(r'-\s*$', '', texto_ley).strip()
+            if texto_ley and r.get('leyenda_neto') is not None:
+                r['leyenda_neto'] += ' ' + texto_ley if r['leyenda_neto'] else texto_ley
             continue
 
         # ── Líneas de totales: solo espacios antes de col 40 ─────────────────
@@ -279,6 +297,12 @@ def parsear_txt(ruta):
                           'categoria','empleado','remuneracion','fecha_pago','periodo_banco'):
                 if not existente.get(campo) and p.get(campo):
                     existente[campo] = p[campo]
+            # Leyenda: combinar ambos bloques
+            if p.get('leyenda_neto'):
+                if existente.get('leyenda_neto'):
+                    existente['leyenda_neto'] += ' ' + p['leyenda_neto']
+                else:
+                    existente['leyenda_neto'] = p['leyenda_neto']
         else:
             recibos.append(p)
 
@@ -293,37 +317,73 @@ def agrupar(contrib):
     return rubros
 
 # ── Gráfico de torta ─────────────────────────────────────────
-def grafico_torta(rubros_contrib, neto):
+def grafico_torta(c, rubros_contrib, neto, cx, cy, radio):
+    """
+    Dibuja torta directamente sobre canvas ReportLab.
+    Sin matplotlib ni numpy. Solo math de Python estándar.
+    """
+    from reportlab.lib.colors import Color
     total_costo = sum(rubros_contrib.values()) + neto
     datos = dict(rubros_contrib)
     datos['Sueldo Neto'] = neto
     labels  = list(datos.keys())
     valores = list(datos.values())
-    cols_g  = [COLORES.get(l, '#90A4AE') for l in labels]
 
-    fig, ax = plt.subplots(figsize=(3.6, 3.0))
-    wedges, _ = ax.pie(
-        valores, colors=cols_g, startangle=90,
-        wedgeprops={'edgecolor':'white','linewidth':0.8},
-        counterclock=False,
-    )
-    for wedge, val in zip(wedges, valores):
+    angulo = 90.0
+    for lbl, val in zip(labels, valores):
+        pct   = val / total_costo * 100
+        sweep = pct * 3.6
+
+        col_hex = COLORES.get(lbl, '#90A4AE').lstrip('#')
+        rc = int(col_hex[0:2],16)/255
+        gc_= int(col_hex[2:4],16)/255
+        bc = int(col_hex[4:6],16)/255
+
+        c.setFillColor(Color(rc, gc_, bc))
+        c.setStrokeColor(colors.white)
+        c.setLineWidth(0.5)
+
+        steps = max(int(sweep * 2), 3)
+        p = c.beginPath()
+        p.moveTo(cx, cy)
+        for i in range(steps + 1):
+            a = math.radians(angulo - i * sweep / steps)
+            p.lineTo(cx + radio * math.cos(a), cy + radio * math.sin(a))
+        p.close()
+        c.drawPath(p, fill=1, stroke=1)
+
+        if pct >= 4:
+            mid_a = math.radians(angulo - sweep / 2)
+            tx = cx + radio * 0.65 * math.cos(mid_a)
+            ty = cy + radio * 0.65 * math.sin(mid_a)
+            c.setFillColor(colors.white)
+            c.setFont("Helvetica-Bold", 6)
+            c.drawCentredString(tx, ty - 3, f"{pct:.0f}%")
+
+        angulo -= sweep
+
+    # Leyenda
+    leg_x = cx - radio
+    leg_y = cy - radio - 0.20*cm
+    col_n = 0
+    for lbl, val in zip(labels, valores):
         pct = val / total_costo * 100
-        if pct >= 3:
-            ang = (wedge.theta1 + wedge.theta2) / 2
-            x_ = 0.68 * np.cos(np.radians(ang))
-            y_ = 0.68 * np.sin(np.radians(ang))
-            ax.text(x_, y_, f'{pct:.0f}%', ha='center', va='center',
-                    fontsize=6.5, color='white', fontweight='bold')
+        col_hex = COLORES.get(lbl, '#90A4AE').lstrip('#')
+        rc = int(col_hex[0:2],16)/255
+        gc_= int(col_hex[2:4],16)/255
+        bc = int(col_hex[4:6],16)/255
+        c.setFillColor(Color(rc, gc_, bc))
+        c.rect(leg_x, leg_y, 5, 5, fill=1, stroke=0)
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica", 5.2)
+        c.drawString(leg_x + 7, leg_y, f"{lbl} {pct:.0f}%")
+        col_n += 1
+        if col_n % 2 == 0:
+            leg_x  = cx - radio
+            leg_y -= 0.26*cm
+        else:
+            leg_x += radio + 0.15*cm
 
-    leyenda = [f"{l}  {v/total_costo*100:.0f}%" for l, v in zip(labels, valores)]
-    ax.legend(wedges, leyenda, loc='lower center', bbox_to_anchor=(0.5,-0.30),
-              ncol=2, fontsize=5.5, frameon=False, handlelength=1.0, columnspacing=0.8)
-    plt.tight_layout(pad=0.1)
-    tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-    plt.savefig(tmp.name, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    return tmp.name
 
 # ── Helpers dibujo ───────────────────────────────────────────
 AZUL      = colors.HexColor('#1565C0')
@@ -404,7 +464,7 @@ def dibujar_recibo(c, r, W, H):
     for t,x,w in zip(['Q.','MES','AÑO','APELLIDO Y NOMBRE','N°LEGAJO','SUELDO BRUTO','ANTIGÜEDAD'],xs1,cw1):
         celda_enc(c,x,y-HF,w,HF,t)
     y-=HF
-    for v,x,w,al in zip(['',mes,anio,r['empleado'],r['legajo'],'$'+r['remuneracion'],ant],
+    for v,x,w,al in zip(['',mes,anio,r['empleado'],r['legajo'],r['remuneracion'],ant],
                          xs1,cw1,['c','c','c','l','c','r','c']):
         celda_val(c,x,y-HV,w,HV,v,align=al)
     y-=HV
@@ -444,7 +504,7 @@ def dibujar_recibo(c, r, W, H):
         c.drawString(ML+3, y-ROW+5, f"{cod} {desc}")
         # Unidad = porcentaje/cantidad si existe
         if cant:
-            c.drawCentredString(xs_b[1]+cw_b[1]/2, y-ROW+5, cant+'%' if ',' in cant else cant)
+            c.drawCentredString(xs_b[1]+cw_b[1]/2, y-ROW+5, cant)
         c.drawRightString(ML+TW-3, y-ROW+5, fm(monto))
         y-=ROW; alt=not alt
 
@@ -463,21 +523,21 @@ def dibujar_recibo(c, r, W, H):
     y-=ROW
 
     y_fin_b = y  # fin tabla B
+    y_fin_b = y  # fin tabla B
 
-    # Gráfico: derecha de sección B, SIEMPRE dentro de los límites
-    # y_sec_b = tope superior, y_fin_b = fondo. El gráfico ocupa ese espacio exacto.
-    GH_disponible = y_sec_b - y_fin_b          # altura real de sección B
-    GH = min(GH_disponible, 5.8*cm)            # no más de 5.8cm
+    # Gráfico: directo sobre canvas, sin matplotlib ni archivos temporales
+    GH_disponible = y_sec_b - y_fin_b
+    GH = min(GH_disponible, 5.8*cm)
     gx = ML + TW + 0.2*cm
-    # Anclado al FONDO para que nunca suba más allá de y_sec_b
     gy = y_fin_b
-    png = grafico_torta(rubros, neto)
-    c.drawImage(png, gx, gy, width=GW, height=GH,
-                preserveAspectRatio=True, anchor='sw')
-    os.unlink(png)
+    cx    = gx + GW / 2
+    cy    = gy + GH * 0.55
+    radio = min(GW, GH) * 0.33
+    grafico_torta(c, rubros, neto, cx, cy, radio)
     c.setFont("Helvetica", 5.0); c.setFillColor(colors.grey)
     c.drawString(gx, gy - 0.16*cm, "Nota: Seg.Social incluye SIPA, Fondo Emp. y Asig.Fam.")
     c.setFillColor(colors.black)
+
 
     y=y_fin_b-0.22*cm
     lh(c,ML,MR,y,col=AZUL,lw=0.8); y-=0.10*cm
@@ -530,12 +590,26 @@ def dibujar_recibo(c, r, W, H):
     y-=BH
     NH=0.78*cm
     rf(c,ML,y-NH,AW,NH,VIOLETA_C); brd(c,ML,y-NH,AW,NH,lw=0.3)
-    c.setFont("Helvetica-Bold",12); c.drawString(ML+0.4*cm,y-NH+NH*0.25,"NETO A PERCIBIR")
-    c.setFont("Helvetica-Bold",14); c.drawRightString(MR-0.4*cm,y-NH+NH*0.25,fm(neto))
+    # Leyenda en letras a la izquierda del neto
+    leyenda = r.get('leyenda_neto','').upper()
+    if leyenda:
+        # Limpiar: unir palabras cortadas con guión (VEINTI- DOS → VEINTIDOS)
+        import re as _re
+        leyenda = _re.sub(r'-\s+', '', leyenda)   # quitar guión+espacio (une la palabra)
+        leyenda = _re.sub(r'\s+', ' ', leyenda).strip()  # quitar espacios dobles
+        if len(leyenda) > 120: leyenda = leyenda[:120]
+        c.setFont("Helvetica",6.5); c.setFillColor(colors.HexColor('#6A1B9A'))
+        c.drawString(ML+0.3*cm, y-NH+NH*0.68, leyenda)
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold",10); c.drawString(ML+0.3*cm, y-NH+NH*0.22, "NETO A PERCIBIR")
+    else:
+        c.setFont("Helvetica-Bold",12); c.drawString(ML+0.4*cm, y-NH+NH*0.25, "NETO A PERCIBIR")
+    c.setFont("Helvetica-Bold",14); c.drawRightString(MR-0.4*cm, y-NH+NH*0.25, fm(neto))
     y-=NH+0.10*cm
 
     if r['banco']:
         c.setFont("Helvetica",7); c.drawString(ML,y,f"Acreditado en: Banco {r['banco']}"); y-=0.28*cm
+
 
     # ══ TABLA INFERIOR (detalle composición) ══════════════════
     y-=0.08*cm
@@ -582,8 +656,10 @@ def dibujar_recibo(c, r, W, H):
 # ── Generar PDF ──────────────────────────────────────────────
 def generar_pdf(recibos, salida):
     c=rl_canvas.Canvas(salida,pagesize=A4); W,H=A4
+    import gc
     for i,r in enumerate(recibos):
         dibujar_recibo(c,r,W,H); c.showPage()
+        gc.collect()  # liberar memoria después de cada recibo
         print(f"  ✓ {i+1}/{len(recibos)}: {r['empleado']} | {r['periodo']}")
     c.save()
     print(f"\n✅ PDF: {salida}  ({len(recibos)} recibo/s)")
